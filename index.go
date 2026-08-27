@@ -585,19 +585,62 @@ func (u *UUIDFieldIndex) parseString(s string, enforceLength bool) ([]byte, erro
 	}
 
 	// The sanitized length is the length of the original string without the "-".
-	sanitized := strings.Replace(s, "-", "", -1)
-	sanitizedLength := len(sanitized)
+	sanitizedLength := l - hyphens
 	if sanitizedLength%2 != 0 {
 		return nil, fmt.Errorf("Input (without hyphens) must be even length")
 	}
 
-	dec, err := hex.DecodeString(sanitized)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid UUID: %v", err)
+	// Decode in a single pass, skipping hyphens wherever they appear, rather
+	// than building a hyphen-free copy of the string and decoding that. The
+	// intermediate copy used to be the largest single allocation on every UUID
+	// index operation; the result below is now the only one.
+	dec := make([]byte, sanitizedLength/2)
+	var hi byte
+	var haveHi bool
+	n := 0
+	for i := 0; i < l; i++ {
+		c := s[i]
+		if c == '-' {
+			continue
+		}
+		v := hexReverse[c]
+		if v == badHexDigit {
+			return nil, fmt.Errorf("Invalid UUID: %v", hex.InvalidByteError(c))
+		}
+		if !haveHi {
+			hi, haveHi = v, true
+			continue
+		}
+		dec[n] = hi<<4 | v
+		n++
+		haveHi = false
 	}
 
 	return dec, nil
 }
+
+// badHexDigit marks a byte that is not a hex digit in hexReverse.
+const badHexDigit = 0xff
+
+// hexReverse maps a byte to its hex value, or badHexDigit if it is not a hex
+// digit. A table lookup rather than a comparison chain, matching what
+// encoding/hex does internally: the branchy form measurably slowed down UUID
+// lookups even though it allocated less.
+var hexReverse = func() (t [256]byte) {
+	for i := range t {
+		t[i] = badHexDigit
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		t[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		t[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		t[c] = c - 'A' + 10
+	}
+	return t
+}()
 
 // FieldSetIndex is used to extract a field from an object using reflection and
 // builds an index on whether the field is set by comparing it against its
