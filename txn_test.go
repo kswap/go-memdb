@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func testDB(t *testing.T) *MemDB {
+func testDB(t testing.TB) *MemDB {
 	db, err := NewMemDB(testValidSchema())
 	if err != nil {
 		t.Fatalf("err: %v", err)

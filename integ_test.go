@@ -535,7 +535,7 @@ func testComplexSchema() *DBSchema {
 	}
 }
 
-func testComplexDB(t *testing.T) *MemDB {
+func testComplexDB(t testing.TB) *MemDB {
 	db, err := NewMemDB(testComplexSchema())
 	if err != nil {
 		t.Fatalf("err: %v", err)
