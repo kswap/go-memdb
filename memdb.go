@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/hashicorp/go-immutable-radix"
+	"github.com/hashicorp/go-memdb/internal/iradix"
 )
 
 // MemDB is an in-memory database providing Atomicity, Consistency, and
