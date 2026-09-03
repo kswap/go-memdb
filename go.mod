@@ -5,8 +5,6 @@ go 1.23
 require github.com/hashicorp/go-immutable-radix v1.3.1
 
 require (
-	github.com/hashicorp/golang-lru v0.5.4 // indirect
-	github.com/kswap/go-immutable-art v0.0.0
+	github.com/hashicorp/golang-lru v0.5.4
+	github.com/kswap/go-immutable-art v0.3.0
 )
-
-replace github.com/kswap/go-immutable-art => ../go-immutable-art
