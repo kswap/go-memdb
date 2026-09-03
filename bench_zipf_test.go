@@ -38,12 +38,52 @@ const (
 	zipfRowCount = 200000 // matches BenchmarkHeap, so the shapes are comparable
 )
 
+// zipfSweep is the range of skews the benchmarks run across.
+//
+// Consul ships to everyone, so no single exponent is the right one to fit: the
+// question a vendor has to answer is not "does this win on our catalog" but
+// "does it win across the catalogs customers actually run, and is there a shape
+// where it regresses" -- because a shape that regresses is someone's production
+// cluster. Sweeping turns the unknown into a reported surface instead of an
+// assumption, and if the arm ordering holds across the whole range then no
+// fleet measurement was ever needed to make the decision.
+//
+// s=0 is the uniform control -- the flat extreme, and the shape the original
+// fixture had. Go's Zipf generator requires s > 1, so 1.05 stands in for the
+// flat-but-skewed end; by 1.4 the head is heavily concentrated. Together they
+// bracket what service catalogs plausibly look like, and the uniform control
+// bounds the flat side that the generator itself cannot reach.
+var zipfSweep = []struct {
+	name string
+	s    float64
+}{
+	{"uniform", 0},
+	{"s=1.05", 1.05},
+	{"s=1.1", 1.1},
+	{"s=1.2", 1.2},
+	{"s=1.4", 1.4},
+}
+
+// rowsForSkew returns the fixture for a given skew, with s<=0 meaning the
+// uniform shape benchRows already builds.
+func rowsForSkew(n int, s float64) []*benchRow {
+	if s <= 0 {
+		return benchRows(n)
+	}
+	return benchRowsZipf(n, s)
+}
+
 // benchRowsZipf builds n rows whose service popularity follows a Zipf
 // distribution over benchServices names, with nodes spread uniformly. Seeded, so
 // every arm and every round sees byte-identical input.
 func benchRowsZipf(n int, s float64) []*benchRow {
 	r := rand.New(rand.NewPCG(zipfSeed, zipfSeed>>3))
 	z := rand.NewZipf(r, s, zipfV, uint64(benchServices-1))
+	// NewZipf returns nil for s <= 1 rather than reporting it, and the nil only
+	// surfaces as a panic inside Uint64 far from the cause.
+	if z == nil {
+		panic(fmt.Sprintf("benchRowsZipf: no Zipf generator for s=%v (requires s > 1)", s))
+	}
 	rows := make([]*benchRow, n)
 	for i := 0; i < n; i++ {
 		node := fmt.Sprintf("node-%05d", i%benchNodes)
@@ -77,32 +117,38 @@ func serviceSizes(rows []*benchRow) []int {
 // is in fact skewed, which is what makes it worth having.
 func TestCatalogShape(t *testing.T) {
 	const n = 200000
-	uniform := serviceSizes(benchRows(n))
-	zipf := serviceSizes(benchRowsZipf(n, zipfExponent))
-
-	describe := func(name string, sizes []int) {
-		total := 0
-		for _, c := range sizes {
-			total += c
+	t.Logf("%-9s %9s %9s %9s %9s %9s", "shape", "services", "largest", "p50", "smallest", "top10%")
+	for _, c := range zipfSweep {
+		sizes := serviceSizes(rowsForSkew(n, c.s))
+		total, top10 := 0, 0
+		for i, v := range sizes {
+			total += v
+			if i < 10 {
+				top10 += v
+			}
 		}
-		top10 := 0
-		for i := 0; i < 10 && i < len(sizes); i++ {
-			top10 += sizes[i]
-		}
-		t.Logf("%-8s services=%d largest=%d smallest=%d top10=%.1f%% of %d instances",
-			name, len(sizes), sizes[0], sizes[len(sizes)-1],
-			100*float64(top10)/float64(total), total)
+		t.Logf("%-9s %9d %9d %9d %9d %8.1f%%",
+			c.name, len(sizes), sizes[0], sizes[len(sizes)/2], sizes[len(sizes)-1],
+			100*float64(top10)/float64(total))
 	}
-	describe("uniform", uniform)
-	describe("zipf", zipf)
 
+	uniform := serviceSizes(benchRows(n))
 	if uniform[0] != uniform[len(uniform)-1] {
 		t.Errorf("uniform fixture is not uniform: largest=%d smallest=%d",
 			uniform[0], uniform[len(uniform)-1])
 	}
-	if zipf[0] < 10*zipf[len(zipf)-1] {
-		t.Errorf("zipf fixture is not skewed: largest=%d smallest=%d",
-			zipf[0], zipf[len(zipf)-1])
+	// Each step up in s must concentrate the head further, or the sweep is not
+	// actually sweeping anything.
+	prev := 0
+	for _, c := range zipfSweep {
+		if c.s <= 0 {
+			continue
+		}
+		got := serviceSizes(rowsForSkew(n, c.s))[0]
+		if got <= prev {
+			t.Errorf("s=%v largest service %d did not grow beyond previous %d", c.s, got, prev)
+		}
+		prev = got
 	}
 }
 
@@ -111,16 +157,20 @@ func zipfDB(tb testing.TB, rows []*benchRow) *MemDB { return benchDB(tb, rows) }
 // BenchmarkZipfInsert is the raft-apply shape against a skewed catalog: most
 // writes land in the popular subtrees, which is where node kinds are widest.
 func BenchmarkZipfInsert(b *testing.B) {
-	rows := benchRowsZipf(zipfRowCount, zipfExponent)
-	db := zipfDB(b, rows)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		txn := db.Txn(true)
-		if err := txn.Insert("svc", rows[i%len(rows)]); err != nil {
-			b.Fatalf("err: %v", err)
-		}
-		txn.Commit()
+	for _, c := range zipfSweep {
+		b.Run(c.name, func(b *testing.B) {
+			rows := rowsForSkew(zipfRowCount, c.s)
+			db := zipfDB(b, rows)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				txn := db.Txn(true)
+				if err := txn.Insert("svc", rows[i%len(rows)]); err != nil {
+					b.Fatalf("err: %v", err)
+				}
+				txn.Commit()
+			}
+		})
 	}
 }
 
@@ -129,38 +179,41 @@ func BenchmarkZipfInsert(b *testing.B) {
 // exactly what an adaptive tree is supposed to exploit and a uniform fixture
 // cannot show.
 func BenchmarkZipfGetPrefix(b *testing.B) {
-	rows := benchRowsZipf(zipfRowCount, zipfExponent)
-	db := zipfDB(b, rows)
+	for _, c := range zipfSweep {
+		rows := rowsForSkew(zipfRowCount, c.s)
+		db := zipfDB(b, rows)
 
-	counts := map[string]int{}
-	for _, r := range rows {
-		counts[r.Service]++
-	}
-	var names []string
-	for n := range counts {
-		names = append(names, n)
-	}
-	sort.Slice(names, func(i, j int) bool { return counts[names[i]] > counts[names[j]] })
-	hot, cold := names[0], names[len(names)-1]
+		counts := map[string]int{}
+		for _, r := range rows {
+			counts[r.Service]++
+		}
+		var names []string
+		for n := range counts {
+			names = append(names, n)
+		}
+		sort.Slice(names, func(i, j int) bool { return counts[names[i]] > counts[names[j]] })
+		hot, cold := names[0], names[len(names)-1]
 
-	for _, c := range []struct {
-		label string
-		svc   string
-	}{{"hot", hot}, {"cold", cold}} {
-		b.Run(fmt.Sprintf("%s/instances=%d", c.label, counts[c.svc]), func(b *testing.B) {
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				txn := db.Txn(false)
-				it, err := txn.Get("svc", "service", c.svc)
-				if err != nil {
-					b.Fatalf("err: %v", err)
+		for _, t := range []struct {
+			label string
+			svc   string
+		}{{"hot", hot}, {"cold", cold}} {
+			b.Run(c.name+"/"+t.label, func(b *testing.B) {
+				b.ReportMetric(float64(counts[t.svc]), "instances")
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					txn := db.Txn(false)
+					it, err := txn.Get("svc", "service", t.svc)
+					if err != nil {
+						b.Fatalf("err: %v", err)
+					}
+					for obj := it.Next(); obj != nil; obj = it.Next() {
+					}
+					txn.Abort()
 				}
-				for obj := it.Next(); obj != nil; obj = it.Next() {
-				}
-				txn.Abort()
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -168,8 +221,14 @@ func BenchmarkZipfGetPrefix(b *testing.B) {
 // the counterpart to BenchmarkHeap on the uniform one. Comparing the two says
 // whether the memory result depends on the fixture being uniform.
 func BenchmarkZipfHeap(b *testing.B) {
+	for _, c := range zipfSweep {
+		b.Run(c.name, func(b *testing.B) { zipfHeapOne(b, c.s) })
+	}
+}
+
+func zipfHeapOne(b *testing.B, skew float64) {
 	const total = zipfRowCount
-	rows := benchRowsZipf(total, zipfExponent)
+	rows := rowsForSkew(total, skew)
 
 	b.ReportAllocs()
 	b.ResetTimer()
