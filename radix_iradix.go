@@ -1,7 +1,7 @@
 // Copyright IBM Corp. 2015, 2026
 // SPDX-License-Identifier: MPL-2.0
 
-//go:build !memdb_art
+//go:build !memdb_art && !memdb_iradix_lazy
 
 package memdb
 

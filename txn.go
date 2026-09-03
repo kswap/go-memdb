@@ -530,6 +530,14 @@ func (txn *Txn) DeleteAll(table, index string, args ...interface{}) (int, error)
 // match instead of full match on the index. The registered indexer must implement
 // PrefixIndexer, otherwise an error is returned.
 func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan struct{}, interface{}, error) {
+	return txn.first(table, index, true, args...)
+}
+
+// first backs both First and FirstWatch. wantWatch is threaded through rather
+// than always asking for a channel and discarding it, because the underlying
+// tree creates notification channels on demand: First would otherwise allocate
+// one per lookup on behalf of a watcher that does not exist.
+func (txn *Txn) first(table, index string, wantWatch bool, args ...interface{}) (<-chan struct{}, interface{}, error) {
 	// Get the index value
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -541,6 +549,13 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 
 	// Do an exact lookup
 	if indexSchema.Unique && val != nil && indexSchema.Name == index {
+		if !wantWatch {
+			obj, ok := indexTxn.Get(val)
+			if !ok {
+				return nil, nil, nil
+			}
+			return nil, obj, nil
+		}
 		watch, obj, ok := indexTxn.GetWatch(val)
 		if !ok {
 			return watch, nil, nil
@@ -550,7 +565,12 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 
 	// Handle non-unique index by using an iterator and getting the first value
 	iter := indexTxn.Root().Iterator()
-	watch := iter.SeekPrefixWatch(val)
+	var watch <-chan struct{}
+	if wantWatch {
+		watch = iter.SeekPrefixWatch(val)
+	} else {
+		iter.SeekPrefix(val)
+	}
 	_, value, _ := iter.Next()
 	return watch, value, nil
 }
@@ -570,6 +590,12 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 // match instead of full match on the index. The registered indexer must implement
 // PrefixIndexer, otherwise an error is returned.
 func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan struct{}, interface{}, error) {
+	return txn.last(table, index, true, args...)
+}
+
+// last backs both Last and LastWatch; see first for why wantWatch is threaded
+// through rather than discarded at the call site.
+func (txn *Txn) last(table, index string, wantWatch bool, args ...interface{}) (<-chan struct{}, interface{}, error) {
 	// Get the index value
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -581,6 +607,13 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 
 	// Do an exact lookup
 	if indexSchema.Unique && val != nil && indexSchema.Name == index {
+		if !wantWatch {
+			obj, ok := indexTxn.Get(val)
+			if !ok {
+				return nil, nil, nil
+			}
+			return nil, obj, nil
+		}
 		watch, obj, ok := indexTxn.GetWatch(val)
 		if !ok {
 			return watch, nil, nil
@@ -590,7 +623,12 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 
 	// Handle non-unique index by using an iterator and getting the last value
 	iter := indexTxn.Root().ReverseIterator()
-	watch := iter.SeekPrefixWatch(val)
+	var watch <-chan struct{}
+	if wantWatch {
+		watch = iter.SeekPrefixWatch(val)
+	} else {
+		iter.SeekPrefix(val)
+	}
 	_, value, _ := iter.Previous()
 	return watch, value, nil
 }
@@ -601,7 +639,7 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 // Note that all values read in the transaction form a consistent snapshot
 // from the time when the transaction was created.
 func (txn *Txn) First(table, index string, args ...interface{}) (interface{}, error) {
-	_, val, err := txn.FirstWatch(table, index, args...)
+	_, val, err := txn.first(table, index, false, args...)
 	return val, err
 }
 
@@ -611,7 +649,7 @@ func (txn *Txn) First(table, index string, args ...interface{}) (interface{}, er
 // Note that all values read in the transaction form a consistent snapshot
 // from the time when the transaction was created.
 func (txn *Txn) Last(table, index string, args ...interface{}) (interface{}, error) {
-	_, val, err := txn.LastWatch(table, index, args...)
+	_, val, err := txn.last(table, index, false, args...)
 	return val, err
 }
 
